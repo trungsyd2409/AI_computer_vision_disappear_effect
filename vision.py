@@ -73,7 +73,7 @@ class HandTracker:
         opts = vision.HandLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(model_asset_path=path),
             running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,  # detect both so the left hand is never mistaken for the right
+            num_hands=2,  # right hand = opacity, left hand = glitch
             min_hand_detection_confidence=min_conf,
             min_hand_presence_confidence=min_conf,
             min_tracking_confidence=min_conf,
@@ -81,26 +81,23 @@ class HandTracker:
         self.lm = vision.HandLandmarker.create_from_options(opts)
         self.clock = _Clock()
 
-    def detect(self, mp_image, w, h, want="Right", mirrored=True):
-        """Return (Nx2 pixel landmarks, label) of the wanted hand, or (None, None).
+    def detect(self, mp_image, w, h, mirrored=True):
+        """Return {"Right": Nx2 pixel landmarks, "Left": ...} (missing hand = no key).
 
         MediaPipe labels handedness assuming a mirrored (selfie) image. We
         flip the frame when mirror is on, so labels are correct; when mirror
         is off we swap them.
         """
         res = self.lm.detect_for_video(mp_image, self.clock.next())
-        best, best_score, best_label = None, -1.0, None
+        found, scores = {}, {}
         for lms, hd in zip(res.hand_landmarks, res.handedness):
             label = hd[0].category_name
             if not mirrored:
                 label = "Left" if label == "Right" else "Right"
-            if want != "Any" and label != want:
-                continue
-            if hd[0].score > best_score:
-                best_score = hd[0].score
-                best_label = label
-                best = np.array([[p.x * w, p.y * h] for p in lms], dtype=np.float32)
-        return best, best_label
+            if hd[0].score > scores.get(label, -1.0):
+                scores[label] = hd[0].score
+                found[label] = np.array([[p.x * w, p.y * h] for p in lms], dtype=np.float32)
+        return found
 
     def close(self):
         self.lm.close()

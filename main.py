@@ -1,7 +1,11 @@
-"""Disappear effect - pinch your right thumb and index finger to vanish.
+"""Disappear effect.
+
+Right hand: thumb-index distance = your opacity (touching 0% .. wide open 100%).
+Left hand:  thumb-index distance = glitch strength (touching 0% .. wide open 100%).
 
 Keys (click the video window first):
-    B      capture background (countdown, step out of the frame)
+    G      (re)capture background (countdown, step out of the frame).
+           It is saved to background.png and loaded automatically next time.
     X      open / close the settings window
     Q/Esc  quit (settings are saved to settings.json)
 """
@@ -14,11 +18,11 @@ import numpy as np
 import config as C
 import overlay as O
 from camera import Camera
-from effect import BackgroundCapture, Fader, MaskRefiner, PinchState, composite, pinch_ratio
+from effect import BackgroundCapture, HandValue, MaskRefiner, glitch_composite
 from settings_ui import SettingsWindow
 from vision import HandTracker, PersonSegmenter, to_mp_image
 
-WIN = "Disappear Effect  |  B: capture background   X: settings   Q: quit"
+WIN = "App"
 
 
 def main():
@@ -36,12 +40,16 @@ def main():
     # events ourselves (root.update) so OpenCV and Tk share the main thread.
     root = tk.Tk()
     root.withdraw()
-    state = {"pinch_ratio": None, "touching": False}
+    state = {}   # live values shown in the settings window
     settings = SettingsWindow(root, cfg, cam, state)
 
     cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
 
-    pinch, fader, refiner, bgcap = PinchState(), Fader(), MaskRefiner(), BackgroundCapture()
+    refiner = MaskRefiner()
+    right = HandValue(rest=1.0)   # right hand -> opacity (1 = fully visible)
+    left = HandValue(rest=0.0)    # left hand  -> glitch  (0 = clean)
+    bgcap = BackgroundCapture(C.BACKGROUND_PATH, cfg["display"]["mirror"])
+    rng = np.random.default_rng()
     mirror_used = cfg["display"]["mirror"]
     frame_id = 0
     fps = 0.0
@@ -74,7 +82,7 @@ def main():
                 hands = HandTracker(eff["min_hand_conf"])
                 hand_conf_used = eff["min_hand_conf"]
             if disp["mirror"] != mirror_used:
-                bgcap.flip()          # keep the saved background lined up
+                bgcap.flip(disp["mirror"])   # keep the saved background lined up
                 refiner.reset()
                 mirror_used = disp["mirror"]
 
@@ -109,23 +117,26 @@ def main():
             bgcap.feed(frame)
             bg_ok = bgcap.valid_for(frame)
 
-            # ---------- hand + pinch ----------
+            # ---------- hands: right = opacity, left = glitch ----------
             mp_img = to_mp_image(frame)
-            lm, _label = hands.detect(mp_img, dw, dh, eff["hand"], disp["mirror"])
-            ratio = pinch_ratio(lm) if lm is not None else None
-            touching = pinch.update(ratio, eff, time.monotonic())
-            state["pinch_ratio"], state["touching"] = ratio, touching
+            found = hands.detect(mp_img, dw, dh, disp["mirror"])
+            now_m = time.monotonic()
+            opacity = right.update(found.get("Right"), eff, now_m)
+            glitch = left.update(found.get("Left"), eff, now_m)
+            if not bg_ok:
+                opacity = 1.0   # cannot hide without a background plate
+            state.update(right_ratio=right.ratio, left_ratio=left.ratio,
+                         opacity=opacity, glitch=glitch)
 
-            # only hide when a background exists
-            opacity = fader.update(touching and bg_ok, eff["fade_time"], dt)
-
-            # ---------- person mask + composite ----------
+            # ---------- person mask + effect ----------
             out = frame
-            # skip segmentation while fully visible (saves CPU)
-            if bg_ok and (opacity < 1.0 or touching):
+            active = opacity < 0.999 or glitch * eff["glitch_strength"] > 0.01
+            if active:   # skip segmentation when nothing to do (saves CPU)
                 conf = seg.person_confidence(mp_img)
                 mask = refiner.refine(conf, eff, frame.shape)
-                out = composite(frame, bgcap.plate, mask, opacity)
+                # without a saved background, glitch is drawn over the live frame
+                plate = bgcap.plate if bg_ok else frame
+                out = glitch_composite(frame, plate, mask, opacity, glitch, eff, rng)
             else:
                 refiner.reset()
 
@@ -135,15 +146,19 @@ def main():
                 O.draw_countdown(view, bgcap.seconds_left(),
                                  bgcap.state == BackgroundCapture.CAPTURING)
             else:
-                if lm is not None:
-                    O.draw_hand(view, lm, touching, opacity, eff["show_skeleton"])
+                if "Right" in found:
+                    O.draw_hand(view, found["Right"], O.GREEN, f"{opacity * 100:.0f}%",
+                                eff["show_skeleton"])
+                if "Left" in found:
+                    O.draw_hand(view, found["Left"], O.MAGENTA, f"{glitch * 100:.0f}%",
+                                eff["show_skeleton"])
                 if not bg_ok:
-                    msg = ("Background size changed - press B again" if bgcap.plate is not None
-                           else "No background! Press B to capture")
+                    msg = ("Background does not fit this resolution - press G" if bgcap.plate is not None
+                           else "No background! Press G to capture")
                     O.draw_warning(view, msg)
                 if cam.error:
                     O.draw_warning(view, cam.error)
-                O.draw_opacity(view, opacity)
+                O.draw_values(view, opacity, glitch)
             O.draw_fps(view, fps, cam.cam_fps)
 
             cv2.imshow(WIN, view)
@@ -174,7 +189,7 @@ def handle_keys(key, bgcap, settings, eff):
         return False
     if key in (ord("x"), ord("X")):
         settings.toggle()
-    elif key in (ord("b"), ord("B")):
+    elif key in (ord("g"), ord("G")):
         bgcap.start(eff["bg_countdown"], eff["bg_frames"])
     return True
 

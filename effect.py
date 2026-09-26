@@ -1,4 +1,4 @@
-"""The disappear effect: pinch detection, fade, mask cleanup, compositing,
+"""The effect: hand opening -> value, mask cleanup, glitch compositing,
 and background-plate capture. Pure numpy/OpenCV, no MediaPipe, so it is easy
 to test."""
 import time
@@ -21,43 +21,43 @@ def pinch_ratio(lm):
     return float(np.linalg.norm(lm[THUMB_TIP] - lm[INDEX_TIP]) / size)
 
 
-class PinchState:
-    """Touch / release with hysteresis so the state does not flicker at the edge."""
+def ratio_to_value(ratio, eff):
+    """Pinch ratio -> 0..1. Fingers touching (<= ratio_closed) = 0,
+    fully open (>= ratio_open) = 1, linear in between."""
+    lo, hi = float(eff["ratio_closed"]), float(eff["ratio_open"])
+    if hi <= lo + 1e-3:
+        hi = lo + 1e-3
+    return float(np.clip((ratio - lo) / (hi - lo), 0.0, 1.0))
 
-    def __init__(self):
-        self.touching = False
-        self.last_seen = 0.0
 
-    def update(self, ratio, eff, now):
-        if ratio is not None:
+class HandValue:
+    """One hand -> one smoothed value in 0..1.
+
+    hand visible  -> value follows how wide the thumb-index are open
+    hand lost     -> "Keep state": keep last value
+                     "Show person": go back to `rest` after a short delay
+    """
+
+    def __init__(self, rest):
+        self.rest = rest            # value when the hand is not there
+        self.value = rest
+        self.ratio = None
+        self.last_seen = -1e9
+
+    def update(self, lm, eff, now):
+        target = None
+        self.ratio = pinch_ratio(lm) if lm is not None else None
+        if self.ratio is not None:
             self.last_seen = now
-            off = max(eff["pinch_off"], eff["pinch_on"] + 0.02)
-            if self.touching and ratio > off:
-                self.touching = False
-            elif not self.touching and ratio < eff["pinch_on"]:
-                self.touching = True
+            target = ratio_to_value(self.ratio, eff)
         elif eff["hand_lost"] == "Show person" and now - self.last_seen > eff["hand_lost_grace"]:
-            self.touching = False
-        return self.touching
-
-
-class Fader:
-    """opacity 1.0 = person fully visible, 0.0 = fully gone."""
-
-    def __init__(self):
-        self.opacity = 1.0
-
-    def update(self, hide, fade_time, dt):
-        target = 0.0 if hide else 1.0
-        if fade_time <= 1e-3:
-            self.opacity = target
-        else:
-            step = dt / fade_time
-            if self.opacity < target:
-                self.opacity = min(target, self.opacity + step)
-            else:
-                self.opacity = max(target, self.opacity - step)
-        return self.opacity
+            target = self.rest
+        if target is not None:
+            a = float(eff["value_smooth"])   # smoothing against hand jitter
+            self.value = self.value * a + target * (1.0 - a)
+            if abs(self.value - target) < 0.005:
+                self.value = target
+        return self.value
 
 
 class MaskRefiner:
@@ -109,12 +109,98 @@ def composite(live, bg, mask, opacity):
     return cv2.blendLinear(bg, live, alpha, 1.0 - alpha)
 
 
+def glitch_composite(live, bg, mask, opacity, glitch, eff, rng):
+    """Person-only effect.
+
+    opacity (right hand): 1 = person fully visible, 0 = gone (background plate).
+    glitch  (left hand):  0 = clean, 1 = maximum glitch (x "Max strength").
+    """
+    g = float(np.clip(glitch, 0.0, 1.0)) * float(eff["glitch_strength"])
+    if mask is None or bg is None:
+        return live
+    if g <= 0.01:
+        return composite(live, bg, mask, opacity)
+    if opacity <= 0.0:
+        return composite(live, bg, mask, 0.0)
+
+    # work only inside the person's bounding box (+ margin for the tearing)
+    x, y, bw, bh = cv2.boundingRect((mask > 0.02).astype(np.uint8))
+    if bw == 0 or bh == 0:
+        return live
+    pad = int(float(eff["glitch_shift"]) * g + float(eff["glitch_rgb"]) * g) + 10
+    H, W = mask.shape[:2]
+    x0, y0 = max(0, x - pad), max(0, y - 10)
+    x1, y1 = min(W, x + bw + pad), min(H, y + bh + 10)
+    out = live.copy()
+    out[y0:y1, x0:x1] = _glitch_roi(live[y0:y1, x0:x1], bg[y0:y1, x0:x1],
+                                    mask[y0:y1, x0:x1], opacity, g, eff, rng)
+    return out
+
+
+def _glitch_roi(live, bg, mask, opacity, g, eff, rng):
+    h, w = mask.shape[:2]
+    person = live.astype(np.float32)
+    alpha = mask.astype(np.float32) * float(opacity)   # right hand: see-through
+
+    # 1) horizontal slices: random shift + random flicker dropout (-> background)
+    max_shift = int(float(eff["glitch_shift"]) * g)
+    y = 0
+    while y < h:
+        y2 = min(h, y + int(rng.integers(3, 30)))
+        if max_shift > 0 and rng.random() < 0.15 + 0.5 * g:
+            dx = int(rng.integers(-max_shift, max_shift + 1))
+            person[y:y2] = np.roll(person[y:y2], dx, axis=1)
+            alpha[y:y2] = np.roll(alpha[y:y2], dx, axis=1)
+        if rng.random() < 0.3 * min(g, 1.0):    # stronger glitch -> more flicker
+            alpha[y:y2] = 0.0
+        y = y2
+
+    # 2) blocks copied from a nearby spot and tinted cyan / magenta
+    ys, xs = np.nonzero(mask > 0.5)
+    if len(ys):
+        y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+        for _ in range(int(8 * g)):
+            bw, bh = int(rng.integers(20, 120)), int(rng.integers(6, 40))
+            by = int(rng.integers(y0, max(y0 + 1, y1 - bh)))
+            bx = int(rng.integers(x0, max(x0 + 1, x1 - bw)))
+            sy = int(np.clip(by + rng.integers(-40, 41), 0, h - bh))
+            sx = int(np.clip(bx + rng.integers(-80, 81), 0, w - bw))
+            if by + bh > h or bx + bw > w:
+                continue
+            block = person[sy:sy + bh, sx:sx + bw].copy()
+            tint = (255.0, 255.0, 0.0) if rng.random() < 0.5 else (255.0, 0.0, 255.0)
+            person[by:by + bh, bx:bx + bw] = block * 0.5 + np.array(tint, np.float32) * 0.5
+
+    # 3) scanlines + blocky noise
+    person[::3] *= 1.0 - 0.4 * min(g, 1.0)
+    if g > 0.05:
+        noise = rng.normal(0.0, 40.0 * g, (max(1, h // 4), max(1, w // 4))).astype(np.float32)
+        noise = cv2.resize(noise, (w, h), interpolation=cv2.INTER_NEAREST)
+        person += noise[..., None]
+
+    # 4) RGB split: blue goes left, red goes right (with their own alpha)
+    d = int(float(eff["glitch_rgb"]) * g)
+    bgf = bg.astype(np.float32)
+    out = np.empty_like(person)
+    for c, dx in ((0, -d), (1, 0), (2, d)):
+        pc = np.roll(person[..., c], dx, axis=1) if dx else person[..., c]
+        ac = np.roll(alpha, dx, axis=1) if dx else alpha
+        out[..., c] = bgf[..., c] + (pc - bgf[..., c]) * ac
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 class BackgroundCapture:
-    """Press B -> countdown -> average N frames -> background plate."""
+    """Press G -> countdown -> average N frames -> background plate.
+
+    The plate is saved to background.png and loaded again on the next start,
+    so you only need to capture once. It is stored un-mirrored on disk.
+    """
 
     IDLE, COUNTDOWN, CAPTURING = 0, 1, 2
 
-    def __init__(self):
+    def __init__(self, path=None, mirrored=False):
+        self.path = path
+        self.mirrored = mirrored
         self.plate = None
         self.state = self.IDLE
         self.t_start = 0.0
@@ -122,7 +208,34 @@ class BackgroundCapture:
         self._n = 0
         self.countdown = 3
         self.frames = 15
+        self.load()
 
+    # ---------------------------------------------------------- disk
+    def load(self):
+        if not self.path:
+            return
+        try:
+            data = np.fromfile(self.path, dtype=np.uint8)   # works with any path on Windows
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+        except OSError:
+            img = None
+        if img is None:
+            return
+        if self.mirrored:
+            img = cv2.flip(img, 1)
+        self.plate = img
+        print(f"[bg] loaded {self.path} {img.shape[1]}x{img.shape[0]}")
+
+    def _save(self):
+        if not self.path or self.plate is None:
+            return
+        img = cv2.flip(self.plate, 1) if self.mirrored else self.plate
+        ok, buf = cv2.imencode(".png", img)
+        if ok:
+            buf.tofile(self.path)
+            print(f"[bg] saved {self.path}")
+
+    # ---------------------------------------------------------- capture
     def start(self, countdown, frames):
         self.state = self.COUNTDOWN
         self.t_start = time.monotonic()
@@ -150,10 +263,23 @@ class BackgroundCapture:
                 self.state = self.IDLE
                 self._acc = None
                 print("[bg] background captured", self.plate.shape)
+                self._save()
 
     def valid_for(self, frame):
-        return self.plate is not None and self.plate.shape == frame.shape
+        """True if the plate fits this frame. Same aspect ratio but another
+        size (e.g. window size changed) -> resize the plate."""
+        if self.plate is None:
+            return False
+        if self.plate.shape == frame.shape:
+            return True
+        ph, pw = self.plate.shape[:2]
+        fh, fw = frame.shape[:2]
+        if abs(pw / ph - fw / fh) < 0.01:
+            self.plate = cv2.resize(self.plate, (fw, fh), interpolation=cv2.INTER_AREA)
+            return True
+        return False
 
-    def flip(self):
+    def flip(self, mirrored):
+        self.mirrored = mirrored
         if self.plate is not None:
             self.plate = np.ascontiguousarray(self.plate[:, ::-1])

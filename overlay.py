@@ -8,6 +8,7 @@ from effect import THUMB_TIP, INDEX_TIP
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 WHITE, BLACK = (255, 255, 255), (0, 0, 0)
 GREEN, RED, CYAN, YELLOW = (80, 220, 80), (60, 60, 255), (255, 220, 0), (0, 220, 255)
+MAGENTA = (255, 80, 255)
 
 
 def fit_size(w, h, max_w, max_h):
@@ -42,7 +43,9 @@ def draw_fps(img, fps, cam_fps):
     text(img, f"cam {cam_fps:4.1f}", (w - 10, 38), 0.5, WHITE, 1, "tr")
 
 
-def draw_hand(img, lm, touching, opacity, show_skeleton=True):
+def draw_hand(img, lm, color, label, show_skeleton=True):
+    """Skeleton + thumb-index line in `color`, with `label` (e.g. "Opacity 64%")
+    written next to the fingers."""
     p = lm.astype(np.int32)
     if show_skeleton:
         for a, b in HAND_CONNECTIONS:
@@ -51,20 +54,18 @@ def draw_hand(img, lm, touching, opacity, show_skeleton=True):
             r = 5 if i in (THUMB_TIP, INDEX_TIP) else 3
             cv2.circle(img, tuple(pt), r, WHITE, -1, cv2.LINE_AA)
             cv2.circle(img, tuple(pt), r, BLACK, 1, cv2.LINE_AA)
-    # line between thumb tip and index tip: green = apart, red = touching
-    color = RED if touching else GREEN
     t, i = tuple(p[THUMB_TIP]), tuple(p[INDEX_TIP])
     cv2.line(img, t, i, color, 3, cv2.LINE_AA)
     cv2.circle(img, t, 7, color, -1, cv2.LINE_AA)
     cv2.circle(img, i, 7, color, -1, cv2.LINE_AA)
-    # opacity label next to the fingers
     mid = ((t[0] + i[0]) // 2 + 14, (t[1] + i[1]) // 2)
-    text(img, f"{opacity * 100:.0f}%", mid, 0.6, color, 2, "tl")
+    text(img, label, mid, 0.6, color, 2, "tl")
 
 
-def draw_opacity(img, opacity):
+def draw_values(img, opacity, glitch):
     h = img.shape[0]
-    text(img, f"Opacity: {opacity * 100:.0f}%", (10, h - 12), 0.7, WHITE, 2, "bl")
+    text(img, f"Glitch:  {glitch * 100:.0f}%", (10, h - 42), 0.7, MAGENTA, 2, "bl")
+    text(img, f"Opacity: {opacity * 100:.0f}%", (10, h - 12), 0.7, GREEN, 2, "bl")
 
 
 def draw_warning(img, msg):

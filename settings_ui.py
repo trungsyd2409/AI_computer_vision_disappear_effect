@@ -1,7 +1,7 @@
 """Settings window (press X). Tkinter, driven from the main loop with root.update().
 
 Tab "Camera": resolution / FPS / codec + every manual control (exposure, gain,
-white balance, focus, ...). Tab "Effect": pinch thresholds, fade, mask quality.
+white balance, focus, ...). Tab "Effect": hand ratio range, glitch, mask quality.
 Changes apply immediately. "Save" writes settings.json (it is also saved when
 you quit the app).
 """
@@ -140,7 +140,7 @@ class SettingsWindow:
         ttk.Button(btns, text="Webcam driver dialog (DSHOW)",
                    command=lambda: self.cam.request("dialog")).pack(side="left", padx=6)
         ttk.Label(f, text="Tip: for a clean effect set Auto exposure + Auto white balance = Off, "
-                          "then capture the background (B).", foreground="#777").grid(
+                          "then capture the background (G).", foreground="#777").grid(
             row=4, column=0, columnspan=4, sticky="w")
 
     def _build_effect(self, f):
@@ -185,19 +185,21 @@ class SettingsWindow:
                 row=row, column=0, columnspan=2, sticky="w")
             row += 1
 
-        section("Hand / pinch")
-        combo("Control hand", eff, "hand", ["Right", "Left", "Any"])
-        scale("Touch when ratio <", eff, "pinch_on", 0.05, 1.0, 0.01)
-        scale("Release when ratio >", eff, "pinch_off", 0.05, 1.5, 0.01)
-        self._labels["pinch"] = ttk.Label(f, text="Current ratio: -", foreground="#2266aa")
-        self._labels["pinch"].grid(row=row, column=1, sticky="w")
+        section("Hands  (right = opacity, left = glitch)")
+        scale("Touching ratio  (= 0%)", eff, "ratio_closed", 0.0, 1.0, 0.01)
+        scale("Wide open ratio (= 100%)", eff, "ratio_open", 0.2, 2.5, 0.01)
+        self._labels["pinch"] = ttk.Label(f, text="-", foreground="#2266aa")
+        self._labels["pinch"].grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
-        combo("When hand is lost", eff, "hand_lost", ["Show person", "Keep state"])
+        scale("Smoothing", eff, "value_smooth", 0.0, 0.95, 0.05)
+        combo("When a hand is lost", eff, "hand_lost", ["Show person", "Keep state"])
         scale("Hand lost delay (s)", eff, "hand_lost_grace", 0.0, 2.0, 0.05)
         scale("Hand detection confidence", eff, "min_hand_conf", 0.1, 0.9, 0.05, on_release=True)
 
-        section("Fade")
-        scale("Fade time (s)", eff, "fade_time", 0.0, 2.0, 0.05)
+        section("Glitch  (left hand)")
+        scale("Max strength", eff, "glitch_strength", 0.0, 2.0, 0.05)
+        scale("Slice tear (px)", eff, "glitch_shift", 0, 200, 1)
+        scale("RGB split (px)", eff, "glitch_rgb", 0, 60, 1)
 
         section("Person mask")
         combo("Segmentation model", eff, "seg_model", list(C.SEG_MODELS))
@@ -208,7 +210,7 @@ class SettingsWindow:
         scale("Temporal smoothing", eff, "mask_smooth", 0.0, 0.95, 0.05)
         check("Invert mask (only if the wrong area disappears)", eff, "invert_mask")
 
-        section("Background capture (key B)")
+        section("Background capture (key G)")
         scale("Countdown (s)", eff, "bg_countdown", 0, 10, 1)
         scale("Frames to average", eff, "bg_frames", 1, 60, 1)
 
@@ -284,9 +286,12 @@ class SettingsWindow:
                 v = self.cam.actual.get(key)
                 txt = "cam: n/a" if v is None or v == -1 else f"cam: {v:g}"
                 self._labels["prop_" + key].config(text=txt)
-            r = self.state.get("pinch_ratio")
+            def fmt(name, key_r, key_v):
+                r = self.state.get(key_r)
+                v = self.state.get(key_v, 0.0)
+                return f"{name}: " + ("no hand" if r is None else f"ratio {r:.2f}") + f" -> {v * 100:.0f}%"
             self._labels["pinch"].config(
-                text="Current ratio: no hand" if r is None else f"Current ratio: {r:.2f}"
-                + ("   (TOUCHING)" if self.state.get("touching") else ""))
+                text=fmt("Right (opacity)", "right_ratio", "opacity") + "\n"
+                + fmt("Left (glitch)", "left_ratio", "glitch"))
         except tk.TclError:
             pass

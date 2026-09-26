@@ -11,6 +11,7 @@ import cv2
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(HERE, "settings.json")
+BACKGROUND_PATH = os.path.join(HERE, "background.png")
 MODELS_DIR = os.path.join(HERE, "models")
 
 # --- Camera properties shown as sliders in the "Camera" tab -----------------
@@ -92,12 +93,17 @@ DEFAULTS = {
         "mirror": True,
     },
     "effect": {
-        "hand": "Right",           # Right / Left / Any
-        "pinch_on": 0.22,          # thumb-index distance / hand size -> "touching"
-        "pinch_off": 0.32,         # must open wider than this to "release" (hysteresis)
-        "hand_lost": "Show person",  # or "Keep state"
+        # Right hand -> opacity, left hand -> glitch.
+        # value = (ratio - ratio_closed) / (ratio_open - ratio_closed), clipped to 0..1
+        # ratio = thumb-index distance / hand size
+        "ratio_closed": 0.2,       # fingers touching -> 0%
+        "ratio_open": 1.0,         # fingers fully open -> 100%
+        "value_smooth": 0.5,       # 0 = raw (jittery) .. 0.95 = very smooth / slow
+        "hand_lost": "Show person",  # "Show person" (100% opacity, 0% glitch) or "Keep state"
         "hand_lost_grace": 0.3,    # seconds before "Show person" kicks in
-        "fade_time": 0.3,          # seconds for 100% -> 0%
+        "glitch_strength": 1.0,    # glitch at 100% left hand: 0 = none .. 2 = crazy
+        "glitch_shift": 60,        # max px a slice is torn sideways
+        "glitch_rgb": 14,          # max px the red / blue channels split
         "seg_model": "selfie_landscape (fast)",
         "mask_low": 0.3,           # confidence below -> background
         "mask_high": 0.7,          # confidence above -> fully person
@@ -127,7 +133,13 @@ def load():
     if os.path.exists(SETTINGS_PATH):
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-                return _deep_merge(DEFAULTS, json.load(f))
+                cfg = _deep_merge(DEFAULTS, json.load(f))
+            # drop options from older versions that no longer exist
+            for sec in ("effect", "display"):
+                for k in list(cfg[sec]):
+                    if k not in DEFAULTS[sec]:
+                        del cfg[sec][k]
+            return cfg
         except (OSError, ValueError) as e:
             print(f"[config] cannot read settings.json ({e}), using defaults")
     return copy.deepcopy(DEFAULTS)
